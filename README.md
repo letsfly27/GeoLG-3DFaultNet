@@ -22,6 +22,7 @@ pip install -r requirements.txt
 - `data/`: Contains a sample 3D seismic patch and its corresponding ground truth for the quick test.
 
 ## 3. Quick Test 
+Note: Please download the pre-trained weights (best_model.pth) from the Releases page of this repository and place it in the root directory before running the test.
 To verify the functionality of our code, we provide a foolproof quick-test script. You do not need to configure complex paths or train the model from scratch.
 
 Simply run the following command in your terminal:
