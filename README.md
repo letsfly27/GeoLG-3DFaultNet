@@ -21,7 +21,7 @@ pip install -r requirements.txt
 - `best_model.pth`: The pre-trained model weights for quick inference.
 - `data/`: Contains a sample 3D seismic patch and its corresponding ground truth for the quick test.
 
-## 3. Quick Test (For Reviewers)
+## 3. Quick Test 
 To verify the functionality of our code, we provide a foolproof quick-test script. You do not need to configure complex paths or train the model from scratch.
 
 Simply run the following command in your terminal:
@@ -34,14 +34,14 @@ python inference.py
 2. It will perform 3D inference on the sample data located in `./data/seis/`.
 3. Upon completion, a high-resolution comparison image (Seismic vs. Ground Truth vs. GeoLG-3DFaultNet) will be automatically generated and saved in the newly created `./predict_images/` directory.
 
-## 4. Training (Optional)
+## 4. Training 
 If you wish to train the model from scratch on your own dataset, please organize your 3D seismic data in `.dat` or `.npy` format, update the data paths in `train.py`, and run:
 ```bash
 python train.py
 ```
 
 ## 5. Citation
-If you find this code or our method useful in your research, please consider citing our paper (Citation details will be updated upon acceptance).
+If you find this code or our method useful in your research, please consider citing our paper.
 
 ## 6. License
 This project is released under the MIT License.
