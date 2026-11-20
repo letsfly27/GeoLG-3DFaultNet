@@ -1,167 +1,113 @@
+import argparse
+from pathlib import Path
+
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn.functional as F
-import os
-import matplotlib.pyplot as plt
-from skimage.morphology import remove_small_objects
 
+from dataset import SUPPORTED_SUFFIXES, read_volume, zscore_normalize
 from model import GeoLG3DFaultNet
+from utils import sliding_window_predict
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-print("🚀 Initializing GeoLG-3DFaultNet Architecture...")
-model = GeoLG3DFaultNet(in_channels=1, num_classes=2).to(device)
-
-
-checkpoint_path = "./best_model.pth"
-
-if os.path.exists(checkpoint_path):
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
-    
-
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        new_key = k.replace('lgfe.', 'lg.').replace('fcom.', 'aco.')
-        new_state_dict[new_key] = v
-
-    model.load_state_dict(new_state_dict, strict=False)
-    print(f"✅ Successfully loaded and mapped pre-trained weights from {checkpoint_path}")
-    model.eval()
-else:
-    print(f"❌ Error: Weights not found at {checkpoint_path}")
-    exit()
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seis_dir", default="./data/test/seis")
+    parser.add_argument("--fault_dir", default=None, help="Optional labels for side-by-side visualization.")
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--model", choices=("geolg", "unet"), default="geolg")
+    parser.add_argument("--output_dir", default="./predictions")
+    parser.add_argument("--shape", type=int, nargs=3, default=(128, 128, 128),
+                        help="Raw .dat volume shape; .npy files are read using their stored shape.")
+    parser.add_argument("--patch_size", type=int, nargs=3, default=(64, 64, 64))
+    parser.add_argument("--overlap", type=float, default=0.5)
+    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--window_size", type=int, default=8)
+    parser.add_argument("--heads", type=int, default=4)
+    return parser.parse_args()
 
 
-def predict_with_tta(model, x):
-    pred1 = model(x)
-    pred1 = F.softmax(pred1, dim=1)[:, 1:2]  
-
-    x_flip_w = torch.flip(x, dims=[-1])
-    pred2 = model(x_flip_w)
-    pred2 = F.softmax(pred2, dim=1)[:, 1:2]
-    pred2 = torch.flip(pred2, dims=[-1]) 
-
-    x_flip_h = torch.flip(x, dims=[-2])
-    pred3 = model(x_flip_h)
-    pred3 = F.softmax(pred3, dim=1)[:, 1:2]
-    pred3 = torch.flip(pred3, dims=[-2])  
-
-    x_flip_d = torch.flip(x, dims=[-3])
-    pred4 = model(x_flip_d)
-    pred4 = F.softmax(pred4, dim=1)[:, 1:2]
-    pred4 = torch.flip(pred4, dims=[-3])  
-
-    avg_pred = (pred1 + pred2 + pred3 + pred4) / 4.0
-    return avg_pred
-
-def infer(volume, shape=(128, 128, 128), chunk_size=96):
-    mean = volume.mean()
-    std = volume.std() + 1e-6
-    volume_norm = (volume - mean) / std
-
-    pred_label = np.zeros(shape, dtype=np.float32)
-    count_map = np.zeros(shape, dtype=np.float32)
-
-    with torch.no_grad():
-        stride = chunk_size // 2
-        for z in range(0, shape[0], stride):
-            for y in range(0, shape[1], stride):
-                for x in range(0, shape[2], stride):
-                    z_start = min(z, shape[0] - chunk_size)
-                    y_start = min(y, shape[1] - chunk_size)
-                    x_start = min(x, shape[2] - chunk_size)
-
-                    z_end = z_start + chunk_size
-                    y_end = y_start + chunk_size
-                    x_end = x_start + chunk_size
-
-                    chunk = volume_norm[z_start:z_end, y_start:y_end, x_start:x_end]
-                    chunk_tensor = torch.tensor(chunk).unsqueeze(0).unsqueeze(0).float().to(device)
-
-                    pred_prob = predict_with_tta(model, chunk_tensor).squeeze().cpu().numpy()
-
-                    pred_label[z_start:z_end, y_start:y_end, x_start:x_end] += pred_prob
-                    count_map[z_start:z_end, y_start:y_end, x_start:x_end] += 1.0
-
-    pred_label = pred_label / count_map
-    pred_binary = (pred_label > 0.5).astype(np.float32)
-    return pred_binary
-
-
-def post_process(pred_mask, min_size=50):
-
-    mask_bool = pred_mask > 0.5
-    clean_mask = remove_small_objects(mask_bool, min_size=min_size)
-    return clean_mask.astype(np.float32)
-
-def save_visualization(seis_data, fault_data, pred_data, save_path, shape=(128, 128, 128)):
-
-    slice_indices = [shape[0] // 2, shape[1] // 2, shape[2] // 2]
-    
-
-    items = [
-        ("Seismic Data", seis_data, "gray"),
-        ("Ground Truth", fault_data, "gray"),
-        ("GeoLG-3DFaultNet (Ours)", pred_data, "hot") 
+def save_preview(seismic, probability, binary, output_path, ground_truth=None):
+    d, h, w = seismic.shape
+    z, y, x = d // 2, h // 2, w // 2
+    views = [
+        ("Inline", seismic[z, :, :], probability[z, :, :], binary[z, :, :],
+         None if ground_truth is None else ground_truth[z, :, :]),
+        ("Crossline", seismic[:, y, :], probability[:, y, :], binary[:, y, :],
+         None if ground_truth is None else ground_truth[:, y, :]),
+        ("Timeline", seismic[:, :, x], probability[:, :, x], binary[:, :, x],
+         None if ground_truth is None else ground_truth[:, :, x]),
     ]
+    ncols = 4 if ground_truth is not None else 3
+    fig, axes = plt.subplots(3, ncols, figsize=(4 * ncols, 10))
+    for row, (name, seis_slice, prob_slice, pred_slice, gt_slice) in enumerate(views):
+        axes[row, 0].imshow(seis_slice, cmap="gray", aspect="auto")
+        axes[row, 0].set_title(f"{name} - Seismic")
+        if ground_truth is not None:
+            axes[row, 1].imshow(gt_slice, cmap="gray", vmin=0, vmax=1, aspect="auto")
+            axes[row, 1].set_title(f"{name} - Ground truth")
+            prob_col, pred_col = 2, 3
+        else:
+            prob_col, pred_col = 1, 2
+        axes[row, prob_col].imshow(prob_slice, cmap="hot", vmin=0, vmax=1, aspect="auto")
+        axes[row, prob_col].set_title(f"{name} - Fault probability")
+        axes[row, pred_col].imshow(pred_slice, cmap="gray", vmin=0, vmax=1, aspect="auto")
+        axes[row, pred_col].set_title(f"{name} - Binary prediction")
+        for axis in axes[row]:
+            axis.axis("off")
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=250, bbox_inches="tight")
+    plt.close(fig)
 
-    fig, axes = plt.subplots(len(items), 3, figsize=(15, 5 * len(items)))
 
-    for row, (title, data, cmap) in enumerate(items):
+def main():
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = build_model(
+        args.model, in_channels=1, num_classes=2, base_channels=32,
+        window_size=args.window_size, heads=args.heads,
+    ).to(device)
+    checkpoint = torch.load(args.checkpoint, map_location=device)
+    state = checkpoint.get("model_state_dict", checkpoint)
+    model.load_state_dict(state, strict=True)
+    model.eval()
 
-        axes[row, 0].imshow(data[slice_indices[0], :, :], cmap=cmap, aspect="auto")
-        axes[row, 0].set_title(f"{title} - X slice {slice_indices[0]}")
+    seis_dir = Path(args.seis_dir)
+    fault_dir = Path(args.fault_dir) if args.fault_dir else None
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    files = sorted(p for p in seis_dir.iterdir()
+                   if p.is_file() and p.suffix.lower() in SUPPORTED_SUFFIXES)
+    if not files:
+        raise RuntimeError(f"No supported seismic volumes found in {seis_dir}")
 
-        axes[row, 1].imshow(data[:, slice_indices[1], :], cmap=cmap, aspect="auto")
-        axes[row, 1].set_title(f"{title} - Y slice {slice_indices[1]}")
+    for index, seismic_path in enumerate(files, start=1):
+        volume_shape = None if seismic_path.suffix.lower() == ".npy" else args.shape
+        seismic = read_volume(seismic_path, volume_shape)
+        normalized = zscore_normalize(seismic)
+        tensor = torch.from_numpy(np.ascontiguousarray(normalized)).float()[None, None]
+        probability = sliding_window_predict(
+            model, tensor, patch_size=args.patch_size, overlap=args.overlap,
+            device=device, blend_mode="gaussian",
+        )[0, 0].cpu().numpy()
+        binary = (probability >= args.threshold).astype(np.uint8)
 
-        axes[row, 2].imshow(data[:, :, slice_indices[2]], cmap=cmap, aspect="auto")
-        axes[row, 2].set_title(f"{title} - Z slice {slice_indices[2]}")
+        np.save(output_dir / f"{seismic_path.stem}_probability.npy", probability.astype(np.float32))
+        np.save(output_dir / f"{seismic_path.stem}_binary.npy", binary)
 
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
+        ground_truth = None
+        if fault_dir is not None:
+            label_path = fault_dir / seismic_path.name
+            if label_path.exists():
+                label_shape = None if label_path.suffix.lower() == ".npy" else args.shape
+                ground_truth = (read_volume(label_path, label_shape) > 0.5).astype(np.uint8)
+        save_preview(
+            seismic, probability, binary,
+            output_dir / f"{seismic_path.stem}_preview.png", ground_truth,
+        )
+        print(f"[{index}/{len(files)}] Saved predictions for {seismic_path.name}")
 
 
 if __name__ == "__main__":
-
-    val_seis_dir = "./data/seis"
-    val_fault_dir = "./data/fault"
-    save_img_dir = "./predict_images"
-
-    os.makedirs(save_img_dir, exist_ok=True)
-
-
-    files = sorted([f for f in os.listdir(val_seis_dir) if f.endswith(".dat")])
-    print(f"🔍 Found {len(files)} samples for Quick Test.")
-
-    for i, f in enumerate(files):
-        print(f"\n[{i + 1}/{len(files)}] Processing {f} ...")
-        
-        seis_path = os.path.join(val_seis_dir, f)
-        fault_path = os.path.join(val_fault_dir, f)
-        save_img_path = os.path.join(save_img_dir, f.replace(".dat", "_result.png"))
-
-
-        try:
-            seis_vol = np.fromfile(seis_path, dtype=np.float32).reshape((128, 128, 128))
-            fault_vol = np.fromfile(fault_path, dtype=np.float32).reshape((128, 128, 128))
-        except Exception as e:
-            print(f"⚠️ Error loading data for {f}: {e}")
-            continue
-
-
-        print("  -> Running TTA Inference...")
-        pred_vol = infer(seis_vol, chunk_size=96)
-
-
-        print("  -> Applying Morphology Post-Processing...")
-        pred_vol = post_process(pred_vol)
-
-
-        print(f"  -> Saving visualization to {save_img_path}...")
-        save_visualization(seis_vol, fault_vol, pred_vol, save_img_path)
-
-    print("\n🎉 All tests completed successfully!")
+    main()
